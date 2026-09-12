@@ -1,6 +1,7 @@
 import os
 import time
 import json
+import base64
 import random
 import pandas as pd
 import paho.mqtt.client as mqtt
@@ -70,7 +71,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ----------------- Mapping Functions ตามสเปก -----------------
+# ----------------- Mapping Functions -----------------
 def map_cond_fan(pwm):
     if pwm >= 200: return "HIGH", 3
     elif pwm >= 120: return "MED", 2
@@ -88,6 +89,15 @@ def map_comp(rpm):
     elif rpm >= 1500: return "MED", 2
     elif rpm > 0: return "LOW", 1
     return "OFF", 0
+
+# ----------------- Base64 Image Loader -----------------
+def get_image_base64(filename):
+    if os.path.exists(filename):
+        with open(filename, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode()
+    return None
+
+img_b64 = get_image_base64("watermarked_img_15331780600498095677.png")
 
 # ----------------- MQTT Daemon & Cache Sync -----------------
 CACHE_FILE = "telemetry_cache.json"
@@ -121,7 +131,7 @@ def start_mqtt_daemon():
 
 mqtt_client = start_mqtt_daemon()
 
-# โหลดข้อมูลสดจาก Cache
+# โหลดข้อมูลจาก Cache
 telemetry = {}
 if os.path.exists(CACHE_FILE):
     try:
@@ -132,7 +142,7 @@ if os.path.exists(CACHE_FILE):
 
 now_ts = time.time()
 last_ts = telemetry.get("_received_ts", 0)
-esp_online = (now_ts - last_ts) < 4.0 if last_ts > 0 else False
+esp_online = (now_ts - last_ts) < 5.0 if last_ts > 0 else False
 
 t1 = float(telemetry.get("temp_1", 0.0))
 t2 = float(telemetry.get("temp_2", 0.0))
@@ -142,12 +152,17 @@ rpm = int(telemetry.get("comp_rpm", 0))
 evap_pwm = int(telemetry.get("evap_pwm", 0))
 cond_pwm = int(telemetry.get("cond_pwm", 0))
 
-mega1_online = esp_online and (t1 > 5.0 or t2 > 5.0 or t3 > 5.0)
+mega1_online = esp_online and (t1 > 0 or t2 > 0 or t3 > 0)
 mega2_online = esp_online and ("comp_rpm" in telemetry)
 
-# ----------------- State & History Tracking -----------------
+# สถานะการทำงานจริงตามข้อมูลฮาร์ดแวร์
+hardware_active = (rpm > 0 or evap_pwm > 0 or cond_pwm > 0)
+
 if "system_active" not in st.session_state:
-    st.session_state.system_active = False
+    st.session_state.system_active = hardware_active
+else:
+    if hardware_active:
+        st.session_state.system_active = True
 
 if "history" not in st.session_state:
     st.session_state.history = pd.DataFrame(columns=[
@@ -173,18 +188,15 @@ evap_lbl, _ = map_evap_fan(evap_pwm)
 cond_lbl, _ = map_cond_fan(cond_pwm)
 
 # ----------------- Header & Project Metadata -----------------
-top_logo_col, top_title_col = st.columns([2.6, 7.4])
-
-possible_image_paths = [
-    r"D:\Capstone_Project\Data\watermarked_img_15331780600498095677.png",
-    "lab_logo.png",
-    "watermarked_img_15331780600498095677.png"
-]
-image_found = next((p for p in possible_image_paths if os.path.exists(p)), None)
+top_logo_col, top_title_col = st.columns([2.5, 7.5])
 
 with top_logo_col:
-    if image_found:
-        st.image(image_found, use_container_width=True)
+    if img_b64:
+        st.markdown(f"""
+            <div style="display:flex; justify-content:center; align-items:center; height:100%;">
+                <img src="data:image/png;base64,{img_b64}" style="max-width:100%; border-radius:12px; box-shadow:0 0 15px rgba(0,242,254,0.3);">
+            </div>
+        """, unsafe_allow_html=True)
     else:
         st.markdown("""
             <div class='cyber-card neon-cyan' style='padding: 10px;'>
@@ -266,8 +278,9 @@ with b3:
     """, unsafe_allow_html=True)
 
 with b4:
-    mqtt_color = "#00ff88" if mqtt_client.is_connected() else "#ff3366"
-    mqtt_text = "CONNECTED" if mqtt_client.is_connected() else "CONNECTING..."
+    mqtt_is_ok = mqtt_client.is_connected()
+    mqtt_color = "#00ff88" if mqtt_is_ok else "#ff3366"
+    mqtt_text = "CONNECTED" if mqtt_is_ok else "CONNECTING..."
     st.markdown(f"""
         <div class="cyber-card" style="border-color: {mqtt_color};">
             <div class="node-title" style="color:{mqtt_color};">HIVEMQ BROKER</div>
@@ -282,8 +295,9 @@ st.write("")
 ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([4, 3, 3])
 
 with ctrl_col1:
-    sys_status_str = "🟢 SYSTEM OPERATIONAL (ACTIVE)" if st.session_state.system_active else "🔴 SYSTEM STOPPED (STANDBY)"
-    status_cls = "neon-green" if st.session_state.system_active else "neon-red"
+    is_running = st.session_state.system_active or hardware_active
+    sys_status_str = "🟢 SYSTEM OPERATIONAL (ACTIVE)" if is_running else "🔴 SYSTEM STOPPED (STANDBY)"
+    status_cls = "neon-green" if is_running else "neon-red"
     st.markdown(f"""
         <div style="padding-top: 5px;">
             <span style="font-size:12px; color:#94a3b8; letter-spacing:1px; font-weight:bold;">MASTER SYSTEM POWER:</span>
@@ -296,7 +310,7 @@ with ctrl_col2:
         st.session_state.system_active = True
         try:
             mqtt_client.publish(MQTT_CONTROL_TOPIC, "1")
-            st.toast("⚡ เริ่มระบบ: ส่งคำสั่ง 1 ไปยัง Mega 2 สำเร็จ!", icon="🟢")
+            st.toast("⚡ เริ่มระบบ: ส่งคำสั่ง 1 สำเร็จ!", icon="🟢")
         except Exception:
             pass
 
@@ -305,7 +319,7 @@ with ctrl_col3:
         st.session_state.system_active = False
         try:
             mqtt_client.publish(MQTT_CONTROL_TOPIC, "0")
-            st.toast("⚠️ หยุดระบบ: ส่งคำสั่ง 0 ไปยัง Mega 2 สำเร็จ!", icon="🛑")
+            st.toast("⚠️ หยุดระบบ: ส่งคำสั่ง 0 สำเร็จ!", icon="🛑")
         except Exception:
             pass
 
@@ -316,9 +330,9 @@ st.markdown("<h5 style='letter-spacing:1px; color:#38bdf8;'>⚡ ACTIVE PROCESS S
 n1, arr1, n2, arr2, n3, arr3, n4 = st.columns([2.8, 0.4, 2.8, 0.4, 2.8, 0.4, 3.4])
 
 with n1:
-    comp_run = (rpm > 0) and st.session_state.system_active
-    comp_txt = comp_lbl if st.session_state.system_active else "OFF"
-    rpm_txt = f"{rpm} RPM" if st.session_state.system_active else "0 RPM"
+    comp_run = (rpm > 0)
+    comp_txt = comp_lbl
+    rpm_txt = f"{rpm} RPM"
     st.markdown(f"""
     <div class="cyber-card" style="border-color: rgba(255, 51, 102, 0.5);">
         <div class="node-title neon-red">① COMPRESSOR</div>
@@ -334,15 +348,16 @@ with arr1:
     st.markdown("<h3 style='text-align: center; color: #ff3366; margin-top: 22px;'>➔</h3>", unsafe_allow_html=True)
 
 with n2:
-    cond_txt = cond_lbl if st.session_state.system_active else "OFF"
-    cond_pwm_txt = f"PWM {cond_pwm}" if st.session_state.system_active else "PWM 0"
+    cond_txt = cond_lbl
+    cond_pwm_txt = f"PWM {cond_pwm}"
+    cond_run = (cond_pwm > 0)
     st.markdown(f"""
     <div class="cyber-card" style="border-color: rgba(255, 153, 0, 0.5);">
         <div class="node-title neon-orange">② CONDENSER (4 FANS)</div>
         <div class="node-val neon-orange">{cond_txt} ({cond_pwm_txt})</div>
         <div class="node-sub">MEGA 1 (L298N PWM)</div>
-        <div style="margin-top:4px; font-size:10.5px; color:{'#ff9900' if st.session_state.system_active else '#64748b'};">
-            ● 4x 24V FANS {'ACTIVE' if st.session_state.system_active else 'STANDBY'}
+        <div style="margin-top:4px; font-size:10.5px; color:{'#00ff88' if cond_run else '#64748b'};">
+            ● 4x 24V FANS {'ACTIVE' if cond_run else 'STANDBY'}
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -351,15 +366,16 @@ with arr2:
     st.markdown("<h3 style='text-align: center; color: #c084fc; margin-top: 22px;'>➔</h3>", unsafe_allow_html=True)
 
 with n3:
-    evap_txt = evap_lbl if st.session_state.system_active else "OFF"
-    evap_pwm_txt = f"PWM {evap_pwm}" if st.session_state.system_active else "PWM 0"
+    evap_txt = evap_lbl
+    evap_pwm_txt = f"PWM {evap_pwm}"
+    evap_run = (evap_pwm > 0)
     st.markdown(f"""
     <div class="cyber-card" style="border-color: rgba(192, 132, 252, 0.5);">
         <div class="node-title neon-purple">③ EVAPORATOR (1 FAN)</div>
         <div class="node-val neon-purple">{evap_txt} ({evap_pwm_txt})</div>
         <div class="node-sub">MEGA 1 (INTERNAL CIRC)</div>
-        <div style="margin-top:4px; font-size:10.5px; color:{'#c084fc' if st.session_state.system_active else '#64748b'};">
-            ● 1x 24V FAN {'ACTIVE' if st.session_state.system_active else 'STANDBY'}
+        <div style="margin-top:4px; font-size:10.5px; color:{'#00ff88' if evap_run else '#64748b'};">
+            ● 1x 24V FAN {'ACTIVE' if evap_run else 'STANDBY'}
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -390,9 +406,9 @@ st.write("")
 # ----------------- Section 2: Metrics Bar -----------------
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Chamber Average", f"{t_avg:.2f} °C", delta="Safe (20-24°C)" if is_safe else "Alert", delta_color="normal" if is_safe else "inverse")
-m2.metric("Compressor", f"{comp_txt}", f"{rpm} RPM" if st.session_state.system_active else "STANDBY")
-m3.metric("Condenser Fans", f"{cond_txt}", f"PWM {cond_pwm}" if st.session_state.system_active else "STANDBY")
-m4.metric("Evaporator Fan", f"{evap_txt}", f"PWM {evap_pwm}" if st.session_state.system_active else "STANDBY")
+m2.metric("Compressor", f"{comp_txt}", f"{rpm} RPM")
+m3.metric("Condenser Fans", f"{cond_txt}", f"PWM {cond_pwm}")
+m4.metric("Evaporator Fan", f"{evap_txt}", f"PWM {evap_pwm}")
 m5.metric("ESP32 Stream", "ONLINE" if esp_online else "OFFLINE", sec_ago)
 
 st.write("")
