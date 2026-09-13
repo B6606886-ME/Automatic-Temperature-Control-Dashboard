@@ -90,7 +90,7 @@ def map_comp(rpm):
     elif rpm > 0: return "LOW", 1
     return "OFF", 0
 
-# ----------------- Base64 Image Loader -----------------
+# ----------------- Base64 Logo Loader -----------------
 def get_image_base64(filename):
     if os.path.exists(filename):
         with open(filename, "rb") as img_file:
@@ -99,20 +99,36 @@ def get_image_base64(filename):
 
 img_b64 = get_image_base64("watermarked_img_15331780600498095677.png")
 
-# ----------------- MQTT Daemon & Cache Sync -----------------
-CACHE_FILE = "telemetry_cache.json"
+# ----------------- MQTT In-Memory Daemon -----------------
 MQTT_BROKER = "broker.hivemq.com"
 MQTT_TELEMETRY_TOPIC = "cooler/dual_mega_esp32/telemetry"
 MQTT_CONTROL_TOPIC = "cooler/dual_mega_esp32/control"
+
+@st.cache_resource
+def get_shared_telemetry():
+    return {
+        "_received_ts": 0,
+        "_raw_str": "Waiting for MQTT message...",
+        "temp_1": 0.0,
+        "temp_2": 0.0,
+        "temp_3": 0.0,
+        "temp_avg": 0.0,
+        "comp_rpm": 0,
+        "evap_pwm": 0,
+        "cond_pwm": 0
+    }
+
+telemetry_store = get_shared_telemetry()
 
 def on_message(client, userdata, msg):
     try:
         raw_text = msg.payload.decode('utf-8')
         payload = json.loads(raw_text)
-        payload["_received_ts"] = time.time()
-        payload["_raw_str"] = raw_text
-        with open(CACHE_FILE, "w") as f:
-            json.dump(payload, f)
+        telemetry_store["_received_ts"] = time.time()
+        telemetry_store["_raw_str"] = raw_text
+        for field in ["temp_1", "temp_2", "temp_3", "temp_avg", "comp_rpm", "evap_pwm", "cond_pwm"]:
+            if field in payload:
+                telemetry_store[field] = payload[field]
     except Exception:
         pass
 
@@ -131,39 +147,32 @@ def start_mqtt_daemon():
 
 mqtt_client = start_mqtt_daemon()
 
-# โหลดข้อมูลจาก Cache
-telemetry = {}
-if os.path.exists(CACHE_FILE):
-    try:
-        with open(CACHE_FILE, "r") as f:
-            telemetry = json.load(f)
-    except Exception:
-        pass
-
+# ดึงข้อมูลจาก In-Memory Store
 now_ts = time.time()
-last_ts = telemetry.get("_received_ts", 0)
+last_ts = telemetry_store.get("_received_ts", 0)
 esp_online = (now_ts - last_ts) < 5.0 if last_ts > 0 else False
 
-t1 = float(telemetry.get("temp_1", 0.0))
-t2 = float(telemetry.get("temp_2", 0.0))
-t3 = float(telemetry.get("temp_3", 0.0))
-t_avg = float(telemetry.get("temp_avg", 0.0))
-rpm = int(telemetry.get("comp_rpm", 0))
-evap_pwm = int(telemetry.get("evap_pwm", 0))
-cond_pwm = int(telemetry.get("cond_pwm", 0))
+t1 = float(telemetry_store.get("temp_1", 0.0))
+t2 = float(telemetry_store.get("temp_2", 0.0))
+t3 = float(telemetry_store.get("temp_3", 0.0))
+t_avg = float(telemetry_store.get("temp_avg", 0.0))
+rpm = int(telemetry_store.get("comp_rpm", 0))
+evap_pwm = int(telemetry_store.get("evap_pwm", 0))
+cond_pwm = int(telemetry_store.get("cond_pwm", 0))
 
-mega1_online = esp_online and (t1 > 0 or t2 > 0 or t3 > 0)
-mega2_online = esp_online and ("comp_rpm" in telemetry)
+mega1_online = esp_online and (t1 > 0.0 or t2 > 0.0 or t3 > 0.0)
+mega2_online = esp_online and ("comp_rpm" in telemetry_store and rpm >= 0)
 
-# สถานะการทำงานจริงตามข้อมูลฮาร์ดแวร์
-hardware_active = (rpm > 0 or evap_pwm > 0 or cond_pwm > 0)
+# เช็คสถานะการทำงานจริงของเครื่องจักร
+hardware_running = (rpm > 0 or evap_pwm > 0 or cond_pwm > 0)
 
 if "system_active" not in st.session_state:
-    st.session_state.system_active = hardware_active
+    st.session_state.system_active = hardware_running
 else:
-    if hardware_active:
+    if hardware_running:
         st.session_state.system_active = True
 
+# ----------------- History Buffer (Max 120 points) -----------------
 if "history" not in st.session_state:
     st.session_state.history = pd.DataFrame(columns=[
         "time", "temp_1", "temp_2", "temp_3", "temp_avg", "comp_stage", "evap_fan_stage", "cond_fan_stage"
@@ -295,7 +304,7 @@ st.write("")
 ctrl_col1, ctrl_col2, ctrl_col3 = st.columns([4, 3, 3])
 
 with ctrl_col1:
-    is_running = st.session_state.system_active or hardware_active
+    is_running = st.session_state.system_active or hardware_running
     sys_status_str = "🟢 SYSTEM OPERATIONAL (ACTIVE)" if is_running else "🔴 SYSTEM STOPPED (STANDBY)"
     status_cls = "neon-green" if is_running else "neon-red"
     st.markdown(f"""
@@ -331,12 +340,10 @@ n1, arr1, n2, arr2, n3, arr3, n4 = st.columns([2.8, 0.4, 2.8, 0.4, 2.8, 0.4, 3.4
 
 with n1:
     comp_run = (rpm > 0)
-    comp_txt = comp_lbl
-    rpm_txt = f"{rpm} RPM"
     st.markdown(f"""
     <div class="cyber-card" style="border-color: rgba(255, 51, 102, 0.5);">
         <div class="node-title neon-red">① COMPRESSOR</div>
-        <div class="node-val neon-red">{comp_txt} ({rpm_txt})</div>
+        <div class="node-val neon-red">{comp_lbl} ({rpm} RPM)</div>
         <div class="node-sub">MEGA 2 CONTROLLER</div>
         <div style="margin-top:4px; font-size:10.5px; color:{'#00ff88' if comp_run else '#ff3366'};">
             ● STATE: {'RUNNING' if comp_run else 'STANDBY'}
@@ -348,13 +355,11 @@ with arr1:
     st.markdown("<h3 style='text-align: center; color: #ff3366; margin-top: 22px;'>➔</h3>", unsafe_allow_html=True)
 
 with n2:
-    cond_txt = cond_lbl
-    cond_pwm_txt = f"PWM {cond_pwm}"
     cond_run = (cond_pwm > 0)
     st.markdown(f"""
     <div class="cyber-card" style="border-color: rgba(255, 153, 0, 0.5);">
         <div class="node-title neon-orange">② CONDENSER (4 FANS)</div>
-        <div class="node-val neon-orange">{cond_txt} ({cond_pwm_txt})</div>
+        <div class="node-val neon-orange">{cond_lbl} (PWM {cond_pwm})</div>
         <div class="node-sub">MEGA 1 (L298N PWM)</div>
         <div style="margin-top:4px; font-size:10.5px; color:{'#00ff88' if cond_run else '#64748b'};">
             ● 4x 24V FANS {'ACTIVE' if cond_run else 'STANDBY'}
@@ -366,13 +371,11 @@ with arr2:
     st.markdown("<h3 style='text-align: center; color: #c084fc; margin-top: 22px;'>➔</h3>", unsafe_allow_html=True)
 
 with n3:
-    evap_txt = evap_lbl
-    evap_pwm_txt = f"PWM {evap_pwm}"
     evap_run = (evap_pwm > 0)
     st.markdown(f"""
     <div class="cyber-card" style="border-color: rgba(192, 132, 252, 0.5);">
         <div class="node-title neon-purple">③ EVAPORATOR (1 FAN)</div>
-        <div class="node-val neon-purple">{evap_txt} ({evap_pwm_txt})</div>
+        <div class="node-val neon-purple">{evap_lbl} (PWM {evap_pwm})</div>
         <div class="node-sub">MEGA 1 (INTERNAL CIRC)</div>
         <div style="margin-top:4px; font-size:10.5px; color:{'#00ff88' if evap_run else '#64748b'};">
             ● 1x 24V FAN {'ACTIVE' if evap_run else 'STANDBY'}
@@ -406,9 +409,9 @@ st.write("")
 # ----------------- Section 2: Metrics Bar -----------------
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Chamber Average", f"{t_avg:.2f} °C", delta="Safe (20-24°C)" if is_safe else "Alert", delta_color="normal" if is_safe else "inverse")
-m2.metric("Compressor", f"{comp_txt}", f"{rpm} RPM")
-m3.metric("Condenser Fans", f"{cond_txt}", f"PWM {cond_pwm}")
-m4.metric("Evaporator Fan", f"{evap_txt}", f"PWM {evap_pwm}")
+m2.metric("Compressor", f"{comp_lbl}", f"{rpm} RPM")
+m3.metric("Condenser Fans", f"{cond_lbl}", f"PWM {cond_pwm}")
+m4.metric("Evaporator Fan", f"{evap_lbl}", f"PWM {evap_pwm}")
 m5.metric("ESP32 Stream", "ONLINE" if esp_online else "OFFLINE", sec_ago)
 
 st.write("")
@@ -490,7 +493,7 @@ else:
 # ----------------- Debug Stream Inspector -----------------
 with st.expander("🔍 RAW MQTT TELEMETRY INSPECTOR", expanded=False):
     st.write(f"**Topic:** `{MQTT_TELEMETRY_TOPIC}`")
-    st.code(telemetry.get("_raw_str", "No payload yet"), language="json")
+    st.code(telemetry_store.get("_raw_str", "No payload yet"), language="json")
 
 time.sleep(1.0)
 st.rerun()
